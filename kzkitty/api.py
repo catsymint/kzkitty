@@ -45,7 +45,7 @@ class APIMap:
 @dataclass
 class PersonalBest:
     player_name: str | None
-    map_name: str
+    map: APIMap
     mode: Mode
     time: timedelta
     teleports: int
@@ -308,12 +308,47 @@ async def map_for_name(name: str, mode: Mode) -> APIMap:
     return APIMap(name=name, tier=tier, vnl_tier=vnl_tier,
                   vnl_pro_tier=vnl_pro_tier, thumbnail=thumbnail)
 
-async def pbs_for_steamid64(steamid64: int, map_name: str, mode: Mode
+def _mode_for_record(record: dict) -> Mode:
+    mode = {'kz_timer': Mode.KZT, 'kz_simple': Mode.SKZ,
+            'kz_vanilla': Mode.VNL}.get(record.get('mode', ''))
+    if mode is None:
+        logger.error('Malformed global API PB (bad mode)')
+        raise APIError
+    return mode
+
+def _record_to_pb(record: dict, api_map: APIMap) -> PersonalBest:
+    player_name = record.get('player_name')
+    if not isinstance(player_name, str) and player_name is not None:
+        logger.error('Malformed global API PB (bad player_name)')
+        raise APIError
+    mode = _mode_for_record(record)
+    time = record.get('time')
+    teleports = record.get('teleports')
+    points = record.get('points')
+    created_on = record.get('created_on')
+    if (not isinstance(time, float) or
+        not isinstance(teleports, int) or
+        not isinstance(points, int) or
+        not isinstance(created_on, str)):
+        logger.error('Malformed global API PB')
+        raise APIError
+    try:
+        date = datetime.fromisoformat(created_on)
+    except ValueError:
+        logger.exception('Malformed global API PB (bad date)')
+        raise APIError
+    date = date.replace(tzinfo=timezone.utc)
+
+    return PersonalBest(player_name=player_name, map=api_map,
+                        time=timedelta(seconds=time), mode=mode,
+                        teleports=teleports, points=points, date=date)
+
+async def pbs_for_steamid64(steamid64: int, api_map: APIMap, mode: Mode
                             ) -> list[PersonalBest]:
     api_mode = {Mode.KZT: 'kz_timer', Mode.SKZ: 'kz_simple',
                 Mode.VNL: 'kz_vanilla'}[mode]
     url = ('https://kztimerglobal.com/api/v2.0/records/top?'
-           f'steamid64={steamid64}&map_name={map_name}&stage=0&'
+           f'steamid64={steamid64}&map_name={api_map.name}&stage=0&'
            f'modes_list_string={api_mode}')
     try:
         async with ClientSession() as session:
@@ -322,40 +357,60 @@ async def pbs_for_steamid64(steamid64: int, map_name: str, mode: Mode
                     logger.error("Couldn't get global API PBs (HTTP %d)",
                                  r.status)
                     raise APIError
-                json = await r.json()
+                records = await r.json()
     except ClientError:
         logger.exception("Couldn't get global API PBs")
         raise APIError
-
-    if not isinstance(json, list):
+    if not isinstance(records, list):
         logger.error('Malformed global API PBs (not a list)')
         raise APIError
 
-    pbs = []
-    for item in json:
-        player_name = item.get('player_name')
-        if not isinstance(player_name, str) and player_name is not None:
-            logger.error('Malformed global API PB (bad player_name)')
-            raise APIError
-        time = item.get('time')
-        teleports = item.get('teleports')
-        points = item.get('points')
-        created_on = item.get('created_on')
-        if (not isinstance(time, float) or
-            not isinstance(teleports, int) or
-            not isinstance(points, int) or
-            not isinstance(created_on, str)):
-            logger.error('Malformed global API PB')
-            raise APIError
-        try:
-            date = datetime.fromisoformat(created_on)
-        except ValueError:
-            logger.exception('Malformed global API PB (bad date)')
-            raise APIError
-        date = date.replace(tzinfo=timezone.utc)
+    return [_record_to_pb(record, api_map) for record in records]
 
-        pb = PersonalBest(player_name=player_name, map_name=map_name,
-                          time=timedelta(seconds=time), mode=mode,
-                          teleports=teleports, points=points, date=date)
-        pbs.append(pb)
-    return pbs
+async def latest_pb_for_steamid64(steamid64: int, mode: Mode
+                                  ) -> PersonalBest | None:
+    api_mode = {Mode.KZT: 'kz_timer', Mode.SKZ: 'kz_simple',
+                Mode.VNL: 'kz_vanilla'}[mode]
+    url = ('https://kztimerglobal.com/api/v2.0/records/top?'
+           f'steamid64={steamid64}&stage=0&limit=9999&has_teleports=true&'
+           f'modes_list_string={api_mode}')
+    try:
+        async with ClientSession() as session:
+            async with session.get(url) as r:
+                if r.status != 200:
+                    logger.error("Couldn't get global API PBs (HTTP %d)",
+                                 r.status)
+                    raise APIError
+                records = await r.json()
+    except ClientError:
+        logger.exception("Couldn't get global API PBs")
+        raise APIError
+    if not isinstance(records, list):
+        logger.error('Malformed global API PBs (not a list)')
+        raise APIError
+    url = ('https://kztimerglobal.com/api/v2.0/records/top?'
+           f'steamid64={steamid64}&stage=0&limit=9999&has_teleports=false&'
+           f'modes_list_string={api_mode}')
+    try:
+        async with ClientSession() as session:
+            async with session.get(url) as r:
+                if r.status != 200:
+                    logger.error("Couldn't get global API PBs (HTTP %d)",
+                                 r.status)
+                    raise APIError
+                pros = await r.json()
+    except ClientError:
+        logger.exception("Couldn't get global API PBs")
+        raise APIError
+    if not isinstance(pros, list):
+        logger.error('Malformed global API PBs (not a list)')
+        raise APIError
+    records.extend(pros)
+    if not records:
+        return None
+
+    records.sort(key=lambda i: i.get('created_on'), reverse=True)
+    record = records[0]
+    mode = _mode_for_record(record)
+    api_map = await map_for_name(record.get('map_name', ''), mode)
+    return _record_to_pb(record, api_map)

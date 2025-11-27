@@ -11,11 +11,12 @@ from hikari.impl import (ContainerComponentBuilder,
 from tortoise.exceptions import DoesNotExist
 
 from kzkitty.api import (APIError, APIMapError, APIMapAmbiguousError,
-                         SteamError, SteamValueError, avatar_for_steamid64,
+                         PersonalBest, SteamError, SteamValueError,
+                         avatar_for_steamid64, latest_pb_for_steamid64,
                          map_for_name, pbs_for_steamid64,
                          steamid64_for_profile)
 from kzkitty.gateway import GatewayBot
-from kzkitty.models import Mode, User
+from kzkitty.models import Mode, Player
 
 bot = GatewayBot(os.environ['DISCORD_TOKEN'])
 client = GatewayClient(bot)
@@ -43,7 +44,7 @@ async def slash_register(ctx: GatewayContext,
         defaults: dict[str, Any] = {'steamid64': steamid64}
         if mode_name is not None:
             defaults['mode'] = mode_name
-        await User.update_or_create(id=ctx.user.id, defaults=defaults)
+        await Player.update_or_create(id=ctx.user.id, defaults=defaults)
         await ctx.respond(f'Registered!', flags=MessageFlag.EPHEMERAL)
 
 @client.include
@@ -52,16 +53,16 @@ async def slash_mode(ctx: GatewayContext,
                      mode_name: Option[str | None, ModeParams]=None) -> None:
     if mode_name is None:
         try:
-            user = await User.get(id=ctx.user.id)
+            player = await Player.get(id=ctx.user.id)
         except DoesNotExist:
             await ctx.respond('No mode set!', flags=MessageFlag.EPHEMERAL)
         else:
-            await ctx.respond(f'Mode set to {user.mode}.',
+            await ctx.respond(f'Mode set to {player.mode}.',
                               flags=MessageFlag.EPHEMERAL)
         return
 
     defaults = {'mode': mode_name}
-    await User.update_or_create(id=ctx.user.id, defaults=defaults)
+    await Player.update_or_create(id=ctx.user.id, defaults=defaults)
     await ctx.respond(f'Mode set to {mode_name}.',
                       flags=MessageFlag.EPHEMERAL)
 
@@ -83,6 +84,60 @@ def _formattime(td: timedelta) -> str:
         s = s.rstrip('0').rstrip('.')
     return s
 
+async def _pb_component(ctx: GatewayContext, player: Player,
+                        pb: PersonalBest, teleports: str | None=None
+                        ) -> ContainerComponentBuilder:
+    player_name = pb.player_name or ctx.user.display_name
+    if pb.mode == Mode.VNL:
+        profile_url = f'https://vnl.kz/#/stats/{player.steamid64}'
+        map_url = f'https://vnl.kz/#/map/{pb.map.name}'
+        if pb.teleports == 0:
+            vnl_tier = pb.map.vnl_pro_tier
+            tier_tag = 'PRO'
+        else:
+            vnl_tier = pb.map.vnl_tier
+            tier_tag = 'TP'
+        tier = f"{vnl_tier or '(unknown)'} ({tier_tag})"
+    else:
+        profile_url = f'https://kzgo.eu/players/{player.steamid64}?{pb.mode}'
+        map_url = f'https://kzgo.eu/maps/{pb.map.name}?{pb.mode}'
+        tier = str(pb.map.tier)
+    body = f'# [{player_name}]({profile_url}) on [{pb.map.name}]({map_url})'
+    if pb.teleports == 0:
+        body += ' (PRO)'
+    elif teleports == 'tp':
+        body += ' (TP)'
+    body += f"""
+
+**Mode:** {pb.mode.upper()}
+**Tier:** {tier or '(unknown)'}
+**Time:** {_formattime(pb.time)}
+"""
+    if pb.teleports:
+        body += f"""**Teleports:** {pb.teleports}
+"""
+    body += f"""**Points:** {pb.points}
+"""
+
+    container = ContainerComponentBuilder()
+    try:
+        avatar = await avatar_for_steamid64(player.steamid64)
+    except SteamError:
+        avatar = None
+    if avatar is not None:
+        thumbnail = ThumbnailComponentBuilder(media=avatar)
+        section = SectionComponentBuilder(accessory=thumbnail)
+        section.add_text_display(body)
+        container.add_component(section)
+    else:
+        container.add_text_display(body)
+    if pb.map.thumbnail is not None:
+        gallery = MediaGalleryComponentBuilder()
+        gallery.add_media_gallery_item(pb.map.thumbnail)
+        container.add_component(gallery)
+    container.add_text_display(f'-# <t:{int(pb.date.timestamp())}>')
+    return container
+
 @client.include
 @slash_command('pb', 'Show personal best times')
 async def slash_pb(ctx: GatewayContext,
@@ -92,18 +147,18 @@ async def slash_pb(ctx: GatewayContext,
                    player: Option[Member | None, MemberParams('Player')]=None
                    ) -> None:
     try:
-        user = await User.get(id=player or ctx.user.id)
+        player = await Player.get(id=player or ctx.user.id)
     except DoesNotExist:
         await ctx.respond('Not registered!', flags=MessageFlag.EPHEMERAL)
         return
     if mode_name is None:
-        mode = user.mode
+        mode = player.mode
     else:
         mode = Mode(mode_name)
 
     try:
         api_map = await map_for_name(map_name, mode)
-        pbs = await pbs_for_steamid64(user.steamid64, api_map.name, mode)
+        pbs = await pbs_for_steamid64(player.steamid64, api_map, mode)
     except APIMapAmbiguousError as e:
         if len(e.db_maps) > 10:
             await ctx.respond(f'More than 10 maps found!',
@@ -132,54 +187,31 @@ async def slash_pb(ctx: GatewayContext,
 
     pbs.sort(key=lambda pb: pb.time)
     pb = pbs[0]
-    player_name = pb.player_name or ctx.user.display_name
-    if mode == Mode.VNL:
-        profile_url = f'https://vnl.kz/#/stats/{user.steamid64}'
-        map_url = f'https://vnl.kz/#/map/{api_map.name}'
-        if pb.teleports == 0:
-            vnl_tier = api_map.vnl_pro_tier
-            tier_tag = 'PRO'
-        else:
-            vnl_tier = api_map.vnl_tier
-            tier_tag = 'TP'
-        tier = f"{vnl_tier or '(unknown)'} ({tier_tag})"
-    else:
-        profile_url = f'https://kzgo.eu/players/{user.steamid64}?{mode}'
-        map_url = f'https://kzgo.eu/maps/{api_map.name}?{mode}'
-        tier = str(api_map.tier)
-    body = f'# [{player_name}]({profile_url}) on [{pb.map_name}]({map_url})'
-    if pb.teleports == 0:
-        body += ' (PRO)'
-    elif teleports == 'tp':
-        body += ' (TP)'
-    body += f"""
+    component = await _pb_component(ctx, player, pb, teleports)
+    await ctx.respond(component=component)
 
-**Mode:** {pb.mode.upper()}
-**Tier:** {tier or '(unknown)'}
-**Time:** {_formattime(pb.time)}
-"""
-    if pb.teleports:
-        body += f"""**Teleports:** {pb.teleports}
-"""
-    body += f"""**Points:** {pb.points}
-"""
-
-    container = ContainerComponentBuilder()
+@client.include
+@slash_command('latest', 'Show most recent personal best')
+async def slash_latest(ctx: GatewayContext,
+                       mode_name: Option[str | None, ModeParams]=None,
+                       player: Option[Member | None,
+                                      MemberParams('Player')]=None
+                       ) -> None:
     try:
-        avatar = await avatar_for_steamid64(user.steamid64)
-    except SteamError:
-        avatar = None
-    if avatar is not None:
-        thumbnail = ThumbnailComponentBuilder(media=avatar)
-        section = SectionComponentBuilder(accessory=thumbnail)
-        section.add_text_display(body)
-        container.add_component(section)
+        player = await Player.get(id=player or ctx.user.id)
+    except DoesNotExist:
+        await ctx.respond('Not registered!', flags=MessageFlag.EPHEMERAL)
+        return
+    if mode_name is None:
+        mode = player.mode
     else:
-        container.add_text_display(body)
-    if api_map.thumbnail is not None:
-        gallery = MediaGalleryComponentBuilder()
-        gallery.add_media_gallery_item(api_map.thumbnail)
-        container.add_component(gallery)
+        mode = Mode(mode_name)
 
-    container.add_text_display(f'-# <t:{int(pb.date.timestamp())}>')
-    await ctx.respond(component=container)
+    pb = await latest_pb_for_steamid64(player.steamid64, mode)
+    if not pb:
+        await ctx.respond("No PB found!",
+                          flags=MessageFlag.EPHEMERAL)
+        return
+
+    component = await _pb_component(ctx, player, pb)
+    await ctx.respond(component=component)

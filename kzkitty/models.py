@@ -14,7 +14,7 @@ class Map(Model):
     vnl_pro_tier = fields.IntField(null=True)
     thumbnail = fields.BinaryField(null=True)
 
-class User(Model):
+class Player(Model):
     id = fields.IntField(primary_key=True)
     steamid64 = fields.IntField(null=True)
     mode = fields.CharEnumField(Mode, default=Mode.KZT)
